@@ -7,20 +7,18 @@ locals {
   all_ips      = ["0.0.0.0/0"]
 }
 
-#Each EC2 instance locates in own VPC subnet
-#which locates in isolate availability zone.
-#Request information about VPC 
-#which will use to auto scaling launch resources.
-data "aws_vpc" "default" {
-  default = true
-}
-#Use one more data source to extract VPC subnets from whole VPC cloud 
-data "aws_subnet_ids" "default" {
-  #link to aws_vpc data source by id  
-  vpc_id = data.aws_vpc.default.id
+#A data source to extract vpc_id and VPC subnets 
+data "terraform_remote_state" "vpc" {
+  backend = "s3"
+
+  config  = {
+    bucket = var.vpc_remote_state_bucket
+    key    = var.vpc_remote_state_key
+    region = "eu-central-1"
+  }
 }
 
-#Data source lets pick information about mysql database
+#Data source lets pick information about mysql database connection
 data "terraform_remote_state" "db" {
   backend = "s3"
 
@@ -32,12 +30,12 @@ data "terraform_remote_state" "db" {
 }
 
 #Data source template_file creates user data file with bash script
-#Transher vars into script-file, gain complite bash script
+#Transfers vars into script-file then lets complite bash script
 data "template_file" "user_data" {
   #Then we call this module from stage or prod,
   #path to user-data.sh will picked from stage/prod module dir,
   #but in reality file resides in one folder with current module
-  #that is why we use "${path.module}/"
+  #that is why we use "${path.module}/" var
   template = file("${path.module}/user-data.sh")
 
   vars = {
@@ -51,8 +49,8 @@ data "template_file" "user_data" {
 resource "aws_lb" "example" {
   name                  = var.cluster_name
   load_balancer_type    ="application"
-  #extract VPC zone ids from data source aws_subnet_ids
-  subnets               = data.aws_subnet_ids.default.ids
+  #extract public_subnets from data source
+  subnets               = data.terraform_remote_state.vpc.outputs.public_subnets
   #link to traffic policy for ALB
   security_groups       = [aws_security_group.alb.id]
 }
@@ -61,7 +59,9 @@ resource "aws_lb" "example" {
 resource "aws_security_group" "alb" {
   #The name consist of the var value and "-alb", 
   #because there are two aws_security_group used in the config
-  name = "${var.cluster_name}-alb"
+  name   = "${var.cluster_name}-alb"
+  #resides in our vpc network created for this infrastructure
+  vpc_id = data.terraform_remote_state.vpc.outputs.vpc_id
 }
 #permit http requests rule
 resource "aws_security_group_rule" "allow_http_inbound" {
@@ -106,12 +106,12 @@ resource "aws_lb_listener" "http" {
 }
 #2. Listener rule
 resource "aws_lb_listener_rule" "asg" {
-  listener_arn  = aws_lb_listener.http.arn
-  priority      = 100
+  listener_arn = aws_lb_listener.http.arn
+  priority     = 100
 
   condition {
     path_pattern {
-        values  = ["*"]
+        values = ["*"]
     }
   }
 
@@ -122,10 +122,11 @@ resource "aws_lb_listener_rule" "asg" {
 }
 #3. Target group
 resource "aws_lb_target_group" "asg" {
-  name      = var.cluster_name
-  port      = var.server_port
-  protocol  = "HTTP"
-  vpc_id    = data.aws_vpc.default.id
+  name     = var.cluster_name
+  port     = var.server_port
+  protocol = "HTTP"
+  #resides in our vpc network created for this infrastructure
+  vpc_id   = data.terraform_remote_state.vpc.outputs.vpc_id
 
   health_check {
     path                = "/"
@@ -141,16 +142,16 @@ resource "aws_lb_target_group" "asg" {
 #auto scaling group to launch EC2 instance on demand
 resource "aws_autoscaling_group" "test-group" {
   #use link as launch_configuration name
-  launch_configuration  = aws_launch_configuration.test.name
-  #extract VPC zone ids from data source aws_subnet_ids
-  vpc_zone_identifier   = data.aws_subnet_ids.default.ids
+  launch_configuration = aws_launch_configuration.test.name
+  #extract private_subnets from data source
+  vpc_zone_identifier  = data.terraform_remote_state.vpc.outputs.private_subnets
   #link to Target group in ALB
-  target_group_arns = [aws_lb_target_group.asg.arn]
-  health_check_type = "ELB"
+  target_group_arns    = [aws_lb_target_group.asg.arn]
+  health_check_type    = "ELB"
 
   #from 2 to 10 ec2 instance will launched
-  min_size = var.min_size
-  max_size = var.max_size
+  min_size             = var.min_size
+  max_size             = var.max_size
 
   #Name are propogated on the launched EC2 instances
   tag {
@@ -170,7 +171,7 @@ resource "aws_launch_configuration" "test" {
   security_groups   = [ aws_security_group.instance.id ]
   
   #get result from data source template_file
-  user_data = data.template_file.user_data.rendered
+  user_data         = data.template_file.user_data.rendered
 
   #configuration param is used then auto scaling implemented
   lifecycle {
@@ -182,7 +183,9 @@ resource "aws_launch_configuration" "test" {
 resource "aws_security_group" "instance" {
   #The name consist of the var value and "-instance", 
   #because there are two aws_security_group used in the config
-  name = "${var.cluster_name}-instance"
+  name   = "${var.cluster_name}-instance"
+  #resides in our vpc network created for this infrastructure
+  vpc_id = data.terraform_remote_state.vpc.outputs.vpc_id
 
   ingress {
     from_port   = var.server_port
